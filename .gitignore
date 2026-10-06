@@ -11,6 +11,7 @@ env/
 *.task
 haarcascade_*.xml
 face_landmarker.task
+pose_landmarker.task
 
 
 __pycache__/
