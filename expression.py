@@ -31,20 +31,24 @@ OBS_PASSWORD = os.getenv("OBS_PASSWORD", "")      # set via environment variable
 SCENE_NAME = os.getenv("SCENE_NAME", "express")
 SOURCE_MOUTH_OPEN = os.getenv("SOURCE_MOUTH_OPEN", "brain1")
 SOURCE_FACE_COVER = os.getenv("SOURCE_FACE_COVER", "brain2")
+SOURCE_TALKING_WALL = os.getenv("SOURCE_TALKING_WALL", "talking_wall") # NEW MEME SOURCE
 OBS_RETRY_SECONDS = 5.0
 
 MOUTH_OPEN_THRESHOLD = 0.40
 HAND_NEAR_MOUTH_RATIO = 0.35
 
-# --- Pose-based detector (PRIMARY: works even when hands overlap / face is hidden) ---
-# All distances are relative to shoulder width (pixels).
+# --- Pose-based detector thresholds ---
 POSE_WRISTS_NEAR_FACE = 0.60    # both wrists within this of the nose/mouth centre
 POSE_WRISTS_TOGETHER = 0.50     # wrist-to-wrist distance
 POSE_INDEX_ABOVE_WRIST = 0.03   # index points sit this much above the wrists
 POSE_ELBOWS_BELOW_WRIST = 0.10  # forearms vertical: elbows lower than wrists
 
-# --- Hand-landmark detector (SECONDARY) ---
-REQUIRE_LEFT_AND_RIGHT = False  # pressed hands are often labelled the same side twice
+# --- Open Hands Talking Pose Thresholds ---
+POSE_OPEN_HANDS_MIN_DIST = 1.0   # Wrists must be separated by at least 1.0x shoulder width
+POSE_WRIST_HEIGHT_MIN = 0.20     # Wrists must be at or above chest level relative to shoulders
+
+# --- Hand-landmark detector ---
+REQUIRE_LEFT_AND_RIGHT = False
 VERTICAL_MIN_RATIO = 0.25
 VERTICAL_MAX_ANGLE_DEG = 40
 TIP_TO_NOSE_RATIO = 0.30
@@ -75,7 +79,7 @@ def check_obs_setup():
         items = [i["sourceName"] for i in
                  ws.call(requests.GetSceneItemList(sceneName=SCENE_NAME)).datain["sceneItems"]]
         print(f"Sources in scene '{SCENE_NAME}': {items}")
-        for s in (SOURCE_MOUTH_OPEN, SOURCE_FACE_COVER):
+        for s in (SOURCE_MOUTH_OPEN, SOURCE_FACE_COVER, SOURCE_TALKING_WALL):
             if s not in items:
                 print(f"!! Source '{s}' is NOT directly in scene '{SCENE_NAME}' "
                       f"(check spelling, or whether it sits inside a group).")
@@ -126,6 +130,7 @@ def set_source_visibility(source_name, visible):
 if try_connect_obs(verbose=True):
     set_source_visibility(SOURCE_MOUTH_OPEN, False)
     set_source_visibility(SOURCE_FACE_COVER, False)
+    set_source_visibility(SOURCE_TALKING_WALL, False)
 
 # ==========================================
 # 4. MediaPipe detectors (VIDEO mode = tracking)
@@ -174,11 +179,9 @@ def dist(a, b):
     return float(np.linalg.norm(a - b))
 
 
-# ---------- Pose detector ----------
+# ---------- Pose detectors ----------
 def detect_pose_cover(pose_lms, w, h):
-    """Both wrists pressed together in front of nose/mouth, index points up, forearms vertical.
-    Pose landmarks: 0 nose, 9/10 mouth, 11/12 shoulders, 13/14 elbows, 15/16 wrists, 19/20 index.
-    Returns (is_pose, any_wrist_near_face, debug_str)."""
+    """Both wrists pressed together in front of nose/mouth, index points up, forearms vertical."""
     P = lambda i: pt(pose_lms[i], w, h)
     sw = dist(P(11), P(12))
     if sw < 20:
@@ -203,6 +206,29 @@ def detect_pose_cover(pose_lms, w, h):
     dbg = (f"pose near={near}({d_l:.2f}/{d_r:.2f}) tog={together}({dist(lw, rw) / sw:.2f}) "
            f"idxUp={idx_up} elbows={elbows_down} low={wrists_low}")
     return (near and together and idx_up and elbows_down and wrists_low), any_near, dbg
+
+
+def detect_open_hands_talking(pose_lms, w, h):
+    """Detects wrists spaced wide open apart at or above chest level (explaining/talking to wall meme)."""
+    P = lambda i: pt(pose_lms[i], w, h)
+    sw = dist(P(11), P(12))
+    if sw < 20:
+        return False, "talking: shoulders not visible"
+
+    lw, rw = P(15), P(16)
+    ls, rs = P(11), P(12)
+    shoulder_y = (ls[1] + rs[1]) / 2.0
+
+    wrist_dist_ratio = dist(lw, rw) / sw
+    hands_wide = wrist_dist_ratio > POSE_OPEN_HANDS_MIN_DIST
+    
+    # Check if wrists are raised up around chest level or higher (y is inverted in screen space)
+    hands_up = (lw[1] < shoulder_y + sw * POSE_WRIST_HEIGHT_MIN) and \
+               (rw[1] < shoulder_y + sw * POSE_WRIST_HEIGHT_MIN)
+
+    is_talking_wall = hands_wide and hands_up
+    dbg = f"talking_wall={is_talking_wall} (dist_ratio={wrist_dist_ratio:.2f}, hands_up={hands_up})"
+    return is_talking_wall, dbg
 
 
 # ---------- Hand-landmark detector ----------
@@ -291,7 +317,7 @@ last_pose_time = 0.0
 active_source_target = None
 cover_streak = 0
 
-print("Keys: Q quit | 1 = test mouth overlay in OBS | 2 = test face-cover overlay in OBS")
+print("Keys: Q quit | 1 = test mouth | 2 = test cover | 3 = test talking wall")
 
 try:
     while cap.isOpened():
@@ -313,12 +339,14 @@ try:
         hand_result = hand_detector.detect_for_video(mp_image, ts)
         pose_result = pose_detector.detect_for_video(mp_image, ts)
 
-        # ---- Pose signal ----
+        # ---- Pose signals ----
         pose_cover, pose_wrist_near, pose_dbg = False, False, "pose: none"
+        talking_wall_active, talking_wall_dbg = False, "talking: none"
         if pose_result.pose_landmarks:
             pose_lms = pose_result.pose_landmarks[0]
             pose_cover, pose_wrist_near, pose_dbg = detect_pose_cover(pose_lms, w, h)
-            for i in (13, 14, 15, 16, 19, 20):
+            talking_wall_active, talking_wall_dbg = detect_open_hands_talking(pose_lms, w, h)
+            for i in (11, 12, 13, 14, 15, 16, 19, 20):
                 p = pt(pose_lms[i], w, h)
                 cv2.circle(frame, (int(p[0]), int(p[1])), 5, (255, 128, 0), -1)
 
@@ -354,9 +382,12 @@ try:
         cover_streak = cover_streak + 1 if is_exact_face_cover else 0
         cover_confirmed = cover_streak >= CONFIRM_FRAMES
 
+        # ---- Determine which pose/meme is active ----
         detected_pose = None
         if cover_confirmed:
             detected_pose = SOURCE_FACE_COVER
+        elif talking_wall_active:
+            detected_pose = SOURCE_TALKING_WALL
         elif is_mouth_open:
             detected_pose = SOURCE_MOUTH_OPEN
 
@@ -378,11 +409,11 @@ try:
         for lms, label, score in hands:
             for p in hand_points_px(lms, w, h):
                 cv2.circle(frame, (int(p[0]), int(p[1])), 3, (0, 255, 255), -1)
-        status = "COVER!" if cover_confirmed else ("MOUTH" if is_mouth_open else "-")
+        status = "COVER!" if cover_confirmed else ("TALKING_WALL" if talking_wall_active else ("MOUTH" if is_mouth_open else "-"))
         cv2.putText(frame, f"{status} face={face_src} hands={len(hands)} streak={cover_streak} mar={mar:.2f}",
                     (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         cv2.putText(frame, pose_dbg, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
-        cv2.putText(frame, hand_dbg, (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
+        cv2.putText(frame, talking_wall_dbg, (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
 
         cv2.imshow("Expression Detector (Press Q to quit)", frame)
         key = cv2.waitKey(5) & 0xFF
@@ -392,6 +423,8 @@ try:
             active_source_target, last_pose_time = SOURCE_MOUTH_OPEN, time.time()
         elif key == ord("2"):
             active_source_target, last_pose_time = SOURCE_FACE_COVER, time.time()
+        elif key == ord("3"):
+            active_source_target, last_pose_time = SOURCE_TALKING_WALL, time.time()
 finally:
     if current_meme:
         set_source_visibility(current_meme, False)
