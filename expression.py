@@ -3,6 +3,8 @@ import cv2
 import time
 import math
 import urllib.request
+from contextlib import ExitStack
+from pathlib import Path
 import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python
@@ -17,10 +19,15 @@ MODELS = {
     "hand_landmarker.task": "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
     "pose_landmarker_full.task": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
 }
-for filename, url in MODELS.items():
-    if not os.path.exists(filename):
-        print(f"Downloading {filename}...")
-        urllib.request.urlretrieve(url, filename)
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def download_models():
+    for filename, url in MODELS.items():
+        path = BASE_DIR / filename
+        if not path.exists():
+            print(f"Downloading {filename}...")
+            urllib.request.urlretrieve(url, path)
 
 # ==========================================
 # 2. Configuration
@@ -32,6 +39,13 @@ SCENE_NAME = os.getenv("SCENE_NAME", "express")
 SOURCE_MOUTH_OPEN = os.getenv("SOURCE_MOUTH_OPEN", "brain1")
 SOURCE_FACE_COVER = os.getenv("SOURCE_FACE_COVER", "brain2")
 SOURCE_TALKING_WALL = os.getenv("SOURCE_TALKING_WALL", "talking_wall") # NEW MEME SOURCE
+SOURCE_CONFUSED_TILT = os.getenv("SOURCE_CONFUSED_TILT", "meme_confused")
+SOURCE_WINK = os.getenv("SOURCE_WINK", "meme_rizz")
+SOURCE_SHUSH = os.getenv("SOURCE_SHUSH", "meme_shush")
+ALL_SOURCES = (
+    SOURCE_MOUTH_OPEN, SOURCE_FACE_COVER, SOURCE_TALKING_WALL,
+    SOURCE_CONFUSED_TILT, SOURCE_WINK, SOURCE_SHUSH,
+)
 OBS_RETRY_SECONDS = 5.0
 
 MOUTH_OPEN_THRESHOLD = 0.40
@@ -60,27 +74,53 @@ FACE_CACHE_SECONDS = 3.0
 CONFIRM_FRAMES = 2
 HOLD_DURATION = 1.5
 
+# New gestures use live landmarks and timed confirmation, independent of FPS.
+# Tune using EAR (eye aspect ratio), roll, and shush distance in the preview.
+TILT_MIN_DEG = 18.0
+TILT_MAX_DEG = 45.0
+TILT_CONFIRM_SECONDS = 0.35
+EYE_CLOSED_EAR = 0.17
+EYE_OPEN_EAR = 0.23
+WINK_MIN_EAR_DIFFERENCE = 0.10
+WINK_MAX_ROLL_DEG = 15.0
+WINK_CONFIRM_SECONDS = 0.22
+FACE_MIN_EYE_WIDTH_PX = 8.0
+FACE_MIN_EYE_WIDTH_RATIO = 0.60  # reject strong side profiles
+FACE_MAX_NOSE_OFFSET_RATIO = 0.30
+SHUSH_MAX_ROLL_DEG = 25.0
+SHUSH_MOUTH_DISTANCE_RATIO = 0.10
+SHUSH_INDEX_MIN_ANGLE_DEG = 155.0
+SHUSH_FOLDED_MAX_ANGLE_DEG = 135.0
+SHUSH_VERTICAL_MAX_ANGLE_DEG = 25.0
+SHUSH_CONFIRM_SECONDS = 0.30
+MAX_CONFIRM_GAP_SECONDS = 0.50
+
 # ==========================================
 # 3. OBS helpers
 # ==========================================
-ws = obsws(OBS_HOST, OBS_PORT, OBS_PASSWORD)
+ws = obsws(OBS_HOST, OBS_PORT, OBS_PASSWORD, timeout=2)
 is_obs_connected = False
-last_obs_attempt = 0.0
+last_obs_attempt = float("-inf")
+scene_item_ids = {}
+source_visibility = {}
 
 
 def check_obs_setup():
     """Print what OBS actually has, so name mismatches are obvious."""
+    scene_item_ids.clear()
+    source_visibility.clear()
     try:
         scenes = [s["sceneName"] for s in ws.call(requests.GetSceneList()).datain["scenes"]]
         print(f"OBS scenes: {scenes}")
         if SCENE_NAME not in scenes:
             print(f"!! Scene '{SCENE_NAME}' NOT FOUND. Set SCENE_NAME to one of the scenes above.")
             return
-        items = [i["sourceName"] for i in
-                 ws.call(requests.GetSceneItemList(sceneName=SCENE_NAME)).datain["sceneItems"]]
-        print(f"Sources in scene '{SCENE_NAME}': {items}")
-        for s in (SOURCE_MOUTH_OPEN, SOURCE_FACE_COVER, SOURCE_TALKING_WALL):
-            if s not in items:
+        items = ws.call(requests.GetSceneItemList(sceneName=SCENE_NAME)).datain["sceneItems"]
+        for item in items:
+            scene_item_ids.setdefault(item["sourceName"], []).append(item["sceneItemId"])
+        print(f"Sources in scene '{SCENE_NAME}': {list(scene_item_ids)}")
+        for s in ALL_SOURCES:
+            if s not in scene_item_ids:
                 print(f"!! Source '{s}' is NOT directly in scene '{SCENE_NAME}' "
                       f"(check spelling, or whether it sits inside a group).")
     except Exception as e:
@@ -89,7 +129,9 @@ def check_obs_setup():
 
 def try_connect_obs(verbose=False):
     global is_obs_connected, last_obs_attempt
-    now = time.time()
+    if is_obs_connected:
+        return True
+    now = time.monotonic()
     if now - last_obs_attempt < OBS_RETRY_SECONDS:
         return is_obs_connected
     last_obs_attempt = now
@@ -111,13 +153,16 @@ def try_connect_obs(verbose=False):
 
 def set_source_visibility(source_name, visible):
     global is_obs_connected
-    if not is_obs_connected and not try_connect_obs():
-        return
+    if not is_obs_connected or source_name not in scene_item_ids:
+        return False
     try:
-        res = ws.call(requests.GetSceneItemId(sceneName=SCENE_NAME, sourceName=source_name))
-        item_id = res.datain["sceneItemId"]
-        ws.call(requests.SetSceneItemEnabled(
-            sceneName=SCENE_NAME, sceneItemId=item_id, sceneItemEnabled=bool(visible)))
+        for item_id in scene_item_ids[source_name]:
+            res = ws.call(requests.SetSceneItemEnabled(
+                sceneName=SCENE_NAME, sceneItemId=item_id, sceneItemEnabled=bool(visible)))
+            if not res.status:
+                raise RuntimeError("OBS rejected the visibility change; check scene/source names")
+        source_visibility[source_name] = bool(visible)
+        return True
     except Exception as e:
         print(f"OBS Toggle Error on '{source_name}': {e}")
         is_obs_connected = False
@@ -125,46 +170,56 @@ def set_source_visibility(source_name, visible):
             ws.disconnect()
         except Exception:
             pass
+        return False
 
 
-if try_connect_obs(verbose=True):
-    set_source_visibility(SOURCE_MOUTH_OPEN, False)
-    set_source_visibility(SOURCE_FACE_COVER, False)
-    set_source_visibility(SOURCE_TALKING_WALL, False)
+def sync_obs_sources(active_source):
+    """Reapply all six states after reconnect; hide old memes before showing a new one."""
+    if not try_connect_obs():
+        return
+    for source in ALL_SOURCES:
+        if source != active_source and source_visibility.get(source) is not False:
+            if source in scene_item_ids and not set_source_visibility(source, False):
+                return
+    if active_source and source_visibility.get(active_source) is not True:
+        set_source_visibility(active_source, True)
 
 # ==========================================
 # 4. MediaPipe detectors (VIDEO mode = tracking)
 # ==========================================
-face_detector = vision.FaceLandmarker.create_from_options(
-    vision.FaceLandmarkerOptions(
-        base_options=python.BaseOptions(model_asset_path="face_landmarker.task"),
-        running_mode=vision.RunningMode.VIDEO,
-        num_faces=1,
-        min_face_detection_confidence=0.3,
-        min_face_presence_confidence=0.3,
-        min_tracking_confidence=0.3,
-    )
-)
-hand_detector = vision.HandLandmarker.create_from_options(
-    vision.HandLandmarkerOptions(
-        base_options=python.BaseOptions(model_asset_path="hand_landmarker.task"),
-        running_mode=vision.RunningMode.VIDEO,
-        num_hands=2,
-        min_hand_detection_confidence=0.3,
-        min_hand_presence_confidence=0.3,
-        min_tracking_confidence=0.3,
-    )
-)
-pose_detector = vision.PoseLandmarker.create_from_options(
-    vision.PoseLandmarkerOptions(
-        base_options=python.BaseOptions(model_asset_path="pose_landmarker_full.task"),
-        running_mode=vision.RunningMode.VIDEO,
-        num_poses=1,
-        min_pose_detection_confidence=0.4,
-        min_pose_presence_confidence=0.4,
-        min_tracking_confidence=0.4,
-    )
-)
+def create_detectors(stack):
+    """ExitStack also closes earlier detectors if a later one fails to initialize."""
+    face_detector = stack.enter_context(vision.FaceLandmarker.create_from_options(
+        vision.FaceLandmarkerOptions(
+            base_options=python.BaseOptions(model_asset_path=str(BASE_DIR / "face_landmarker.task")),
+            running_mode=vision.RunningMode.VIDEO,
+            num_faces=1,
+            min_face_detection_confidence=0.3,
+            min_face_presence_confidence=0.3,
+            min_tracking_confidence=0.3,
+        )
+    ))
+    hand_detector = stack.enter_context(vision.HandLandmarker.create_from_options(
+        vision.HandLandmarkerOptions(
+            base_options=python.BaseOptions(model_asset_path=str(BASE_DIR / "hand_landmarker.task")),
+            running_mode=vision.RunningMode.VIDEO,
+            num_hands=2,
+            min_hand_detection_confidence=0.3,
+            min_hand_presence_confidence=0.3,
+            min_tracking_confidence=0.3,
+        )
+    ))
+    pose_detector = stack.enter_context(vision.PoseLandmarker.create_from_options(
+        vision.PoseLandmarkerOptions(
+            base_options=python.BaseOptions(model_asset_path=str(BASE_DIR / "pose_landmarker_full.task")),
+            running_mode=vision.RunningMode.VIDEO,
+            num_poses=1,
+            min_pose_detection_confidence=0.4,
+            min_pose_presence_confidence=0.4,
+            min_tracking_confidence=0.4,
+        )
+    ))
+    return face_detector, hand_detector, pose_detector
 
 # ==========================================
 # 5. Geometry helpers (pixel space)
@@ -177,6 +232,143 @@ def pt(lm, w, h):
 
 def dist(a, b):
     return float(np.linalg.norm(a - b))
+
+
+class TimedConfirmation:
+    """Require consecutive positive samples spanning a minimum duration."""
+
+    def __init__(self, seconds):
+        self.seconds = seconds
+        self.since = None
+        self.last_sample = None
+
+    def update(self, detected, now):
+        if self.last_sample is not None and now - self.last_sample > MAX_CONFIRM_GAP_SECONDS:
+            self.since = None
+        self.last_sample = now
+        if not detected:
+            self.since = None
+            return False
+        if self.since is None:
+            self.since = now
+        return now - self.since >= self.seconds
+
+
+def eye_aspect_ratio(face, indices, w, h):
+    """Two lid gaps divided by twice the eye width; invariant to in-plane roll."""
+    a, b, c, d, e, f = [pt(face[i], w, h) for i in indices]
+    return (dist(b, f) + dist(c, e)) / max(2.0 * dist(a, d), 1.0)
+
+
+def expression_geometry(face, w, h):
+    """Pixel-space geometry avoids aspect-ratio distortion in non-square video."""
+    if face is None or len(face) < 468:
+        return None
+    right_width = dist(pt(face[33], w, h), pt(face[133], w, h))
+    left_width = dist(pt(face[362], w, h), pt(face[263], w, h))
+    if min(left_width, right_width) < FACE_MIN_EYE_WIDTH_PX:
+        return None
+    right_eye = (pt(face[33], w, h) + pt(face[133], w, h)) / 2
+    left_eye = (pt(face[362], w, h) + pt(face[263], w, h)) / 2
+    axis = left_eye - right_eye
+    eye_span = dist(left_eye, right_eye)
+    if eye_span < 20.0:
+        return None
+    roll = (math.degrees(math.atan2(axis[1], axis[0])) + 90) % 180 - 90
+    midpoint = (left_eye + right_eye) / 2
+    nose_offset = abs(float(np.dot(pt(face[1], w, h) - midpoint, axis / eye_span))) / eye_span
+    frontal = (min(left_width, right_width) / max(left_width, right_width)
+               >= FACE_MIN_EYE_WIDTH_RATIO and nose_offset <= FACE_MAX_NOSE_OFFSET_RATIO)
+    return {
+        "roll": roll,
+        "left_ear": eye_aspect_ratio(face, (362, 385, 387, 263, 373, 380), w, h),
+        "right_ear": eye_aspect_ratio(face, (33, 160, 158, 133, 153, 144), w, h),
+        "mar": dist(pt(face[13], w, h), pt(face[14], w, h))
+               / max(dist(pt(face[61], w, h), pt(face[291], w, h)), 1.0),
+        "frontal": frontal,
+        "mouth": (pt(face[13], w, h) + pt(face[14], w, h)) / 2,
+        "nose": pt(face[1], w, h),
+        "face_h": dist(pt(face[10], w, h), pt(face[152], w, h)),
+    }
+
+
+def detect_confused_tilt(g):
+    """Math-is-not-mathing: tilt either way, with both eyes open and mouth relaxed."""
+    return bool(g and g["frontal"] and TILT_MIN_DEG <= abs(g["roll"]) <= TILT_MAX_DEG
+                and min(g["left_ear"], g["right_ear"]) >= EYE_OPEN_EAR
+                and g["mar"] < MOUTH_OPEN_THRESHOLD)
+
+
+def detect_wink(g):
+    """Rizz: one eye closed and the other open. A two-eye blink is rejected."""
+    if not g or not g["frontal"] or abs(g["roll"]) > WINK_MAX_ROLL_DEG:
+        return False
+    closed, opened = sorted((g["left_ear"], g["right_ear"]))
+    return (closed <= EYE_CLOSED_EAR and opened >= EYE_OPEN_EAR
+            and opened - closed >= WINK_MIN_EAR_DIFFERENCE
+            and g["mar"] < MOUTH_OPEN_THRESHOLD)
+
+
+def joint_angle(a, b, c):
+    """Angle at b in degrees; a straight finger is close to 180 degrees."""
+    ba, bc = a - b, c - b
+    denominator = float(np.linalg.norm(ba) * np.linalg.norm(bc))
+    if denominator < 1e-6:
+        return 0.0
+    return math.degrees(math.acos(float(np.clip(np.dot(ba, bc) / denominator, -1.0, 1.0))))
+
+
+def point_segment_distance(point, a, b):
+    segment = b - a
+    length_sq = float(np.dot(segment, segment))
+    if length_sq < 1e-6:
+        return dist(point, a)
+    t = float(np.clip(np.dot(point - a, segment) / length_sq, 0.0, 1.0))
+    return dist(point, a + t * segment)
+
+
+def detect_shush(hands, g, w, h):
+    """Let-him-cook: one upright index at the lips, other three fingers curled.
+
+    This is a 2D alignment heuristic, not a measurement of physical lip contact.
+    Require a live face; cached geometry is reserved for the old cover detector.
+    """
+    if not g or not g["frontal"] or abs(g["roll"]) > SHUSH_MAX_ROLL_DEG:
+        return False, "shush: need live frontal face"
+    if len(hands) != 1 or g["face_h"] < 30:
+        return False, "shush: need one hand"
+    points = hand_points_px(hands[0][0], w, h)
+    wrist, base, pip, dip, tip = points[[0, 5, 6, 7, 8]]
+    straight = (joint_angle(base, pip, dip) >= SHUSH_INDEX_MIN_ANGLE_DEG
+                and joint_angle(pip, dip, tip) >= SHUSH_INDEX_MIN_ANGLE_DEG)
+    folded = all(
+        joint_angle(points[mcp], points[joint], points[end]) < SHUSH_FOLDED_MAX_ANGLE_DEG
+        and dist(points[end], wrist) < 1.15 * dist(points[joint], wrist)
+        for mcp, joint, end in ((9, 10, 12), (13, 14, 16), (17, 18, 20))
+    )
+    rise = float(base[1] - tip[1])
+    upright = (rise > 0.18 * g["face_h"] and
+               math.degrees(math.atan2(abs(float(tip[0] - base[0])), max(rise, 1e-6)))
+               <= SHUSH_VERTICAL_MAX_ANGLE_DEG)
+    gap = point_segment_distance(g["mouth"], pip, tip) / g["face_h"]
+    at_lips = (gap <= SHUSH_MOUTH_DISTANCE_RATIO
+               and g["nose"][1] - 0.08 * g["face_h"] <= tip[1]
+               <= g["mouth"][1] + 0.03 * g["face_h"]
+               and base[1] > g["mouth"][1] and wrist[1] > base[1])
+    active = straight and folded and upright and at_lips
+    return active, f"shush={active} gap={gap:.2f} straight={straight} curl={folded} up={upright}"
+
+
+def choose_meme(cover, talking, mouth, tilt, wink, shush):
+    """Specific hand gestures win; only one source is selected per frame."""
+    for detected, source in (
+        (cover, SOURCE_FACE_COVER), (shush, SOURCE_SHUSH),
+        (talking, SOURCE_TALKING_WALL), (wink, SOURCE_WINK),
+        (tilt, SOURCE_CONFUSED_TILT), (mouth, SOURCE_MOUTH_OPEN),
+    ):
+        if detected:
+            return source
+    return None
 
 
 # ---------- Pose detectors ----------
@@ -241,7 +433,7 @@ def face_metrics(face, w, h):
         "mouth": (pt(face[13], w, h) + pt(face[14], w, h)) / 2,
         "face_h": max(abs(chin[1] - forehead[1]), 1.0),
         "face_w": max(abs(face[454].x - face[234].x) * w, 1.0),
-        "t": time.time(),
+        "t": time.monotonic(),
     }
 
 
@@ -304,33 +496,38 @@ def any_hand_near_mouth(hand_result, m, w, h):
 # ==========================================
 # 6. Main loop
 # ==========================================
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-if not cap.isOpened():
-    cap = cv2.VideoCapture(0)
+def run_detection(cap, face_detector, hand_detector, pose_detector):
+    start_time = time.monotonic()
+    last_ts = -1
+    cached_face = None
+    current_meme = None
+    last_pose_time = float("-inf")
+    active_source_target = None
+    cover_streak = 0
+    read_failures = 0
+    manual_source, manual_until = None, 0.0
+    tilt_timer = TimedConfirmation(TILT_CONFIRM_SECONDS)
+    wink_timer = TimedConfirmation(WINK_CONFIRM_SECONDS)
+    shush_timer = TimedConfirmation(SHUSH_CONFIRM_SECONDS)
+    test_keys = {ord(str(i)): source for i, source in enumerate(ALL_SOURCES, start=1)}
 
-start_time = time.time()
-last_ts = -1
-cached_face = None
-
-current_meme = None
-last_pose_time = 0.0
-active_source_target = None
-cover_streak = 0
-
-print("Keys: Q quit | 1 = test mouth | 2 = test cover | 3 = test talking wall")
-
-try:
+    print("Keys: Q quit | 1 mouth | 2 cover | 3 talking wall | 4 confused | 5 wink | 6 shush")
     while cap.isOpened():
         success, frame = cap.read()
         if not success or frame is None:
+            read_failures += 1
+            if read_failures >= 30:
+                raise RuntimeError("Camera stopped returning frames. Check camera access/index.")
             time.sleep(0.01)
             continue
+        read_failures = 0
+        now = time.monotonic()
 
         h, w, _ = frame.shape
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-        ts = int((time.time() - start_time) * 1000)
+        ts = int((now - start_time) * 1000)
         if ts <= last_ts:
             ts = last_ts + 1
         last_ts = ts
@@ -356,7 +553,7 @@ try:
         metrics, face_src = None, "none"
         if face_live:
             metrics, face_src = face_metrics(face, w, h), "live"
-        elif cached_face and time.time() - cached_face["t"] < FACE_CACHE_SECONDS:
+        elif cached_face and now - cached_face["t"] < FACE_CACHE_SECONDS:
             metrics, face_src = cached_face, "cached"
 
         hands = get_hands(hand_result)
@@ -382,56 +579,97 @@ try:
         cover_streak = cover_streak + 1 if is_exact_face_cover else 0
         cover_confirmed = cover_streak >= CONFIRM_FRAMES
 
+        # New expressions NEVER use cached face landmarks. Hands near the mouth
+        # suppress eye/tilt guesses, but are necessary for the shush gesture.
+        geometry = expression_geometry(face, w, h)
+        face_unobstructed = not hands_near_face and not is_exact_face_cover
+        tilt_confirmed = tilt_timer.update(
+            face_unobstructed and detect_confused_tilt(geometry), now)
+        wink_confirmed = wink_timer.update(
+            face_unobstructed and detect_wink(geometry), now)
+        shush_raw, shush_dbg = detect_shush(hands, geometry, w, h)
+        shush_confirmed = shush_timer.update(shush_raw and not is_exact_face_cover, now)
+
         # ---- Determine which pose/meme is active ----
-        detected_pose = None
-        if cover_confirmed:
-            detected_pose = SOURCE_FACE_COVER
-        elif talking_wall_active:
-            detected_pose = SOURCE_TALKING_WALL
-        elif is_mouth_open:
-            detected_pose = SOURCE_MOUTH_OPEN
+        detected_pose = choose_meme(
+            cover_confirmed, talking_wall_active, is_mouth_open,
+            tilt_confirmed, wink_confirmed, shush_confirmed)
 
-        if detected_pose:
-            active_source_target = detected_pose
-            last_pose_time = time.time()
-
-        active_meme = active_source_target if time.time() - last_pose_time < HOLD_DURATION else None
+        if manual_source and now < manual_until:
+            active_meme = manual_source
+        else:
+            manual_source = None
+            if detected_pose:
+                active_source_target = detected_pose
+                last_pose_time = now
+            active_meme = active_source_target if now - last_pose_time < HOLD_DURATION else None
 
         if active_meme != current_meme:
-            if current_meme:
-                set_source_visibility(current_meme, False)
             if active_meme:
                 print(f"Triggered Pose! Showing OBS Source: {active_meme}")
-                set_source_visibility(active_meme, True)
             current_meme = active_meme
+        sync_obs_sources(active_meme)
 
         # ---- Debug overlay ----
         for lms, label, score in hands:
             for p in hand_points_px(lms, w, h):
                 cv2.circle(frame, (int(p[0]), int(p[1])), 3, (0, 255, 255), -1)
-        status = "COVER!" if cover_confirmed else ("TALKING_WALL" if talking_wall_active else ("MOUTH" if is_mouth_open else "-"))
-        cv2.putText(frame, f"{status} face={face_src} hands={len(hands)} streak={cover_streak} mar={mar:.2f}",
-                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        cv2.putText(frame, pose_dbg, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
-        cv2.putText(frame, talking_wall_dbg, (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
+        face_dbg = "new gestures: no live face geometry"
+        if geometry:
+            face_dbg = (f"roll={geometry['roll']:.1f} EAR L/R={geometry['left_ear']:.2f}/"
+                        f"{geometry['right_ear']:.2f} front={geometry['frontal']} "
+                        f"tilt={tilt_confirmed} wink={wink_confirmed}")
+        lines = (
+            f"OBS={'ON' if is_obs_connected else 'OFF'} active={active_meme or '-'} "
+            f"face={face_src} hands={len(hands)} mar={mar:.2f}",
+            pose_dbg, talking_wall_dbg, face_dbg, shush_dbg,
+            "Q quit | 1 mouth 2 cover 3 wall 4 tilt 5 wink 6 shush",
+        )
+        for i, line in enumerate(lines):
+            cv2.putText(frame, line, (10, 20 + i * 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
 
         cv2.imshow("Expression Detector (Press Q to quit)", frame)
         key = cv2.waitKey(5) & 0xFF
-        if key == ord("q"):
+        if key in (ord("q"), ord("Q"), 27):
             break
-        elif key == ord("1"):
-            active_source_target, last_pose_time = SOURCE_MOUTH_OPEN, time.time()
-        elif key == ord("2"):
-            active_source_target, last_pose_time = SOURCE_FACE_COVER, time.time()
-        elif key == ord("3"):
-            active_source_target, last_pose_time = SOURCE_TALKING_WALL, time.time()
-finally:
-    if current_meme:
-        set_source_visibility(current_meme, False)
-    cap.release()
-    cv2.destroyAllWindows()
-    if is_obs_connected:
+        elif key in test_keys:
+            manual_source = test_keys[key]
+            manual_until = time.monotonic() + HOLD_DURATION
+            active_source_target = None
+            # A manual test stays visible even when another gesture is detected.
+            sync_obs_sources(manual_source)
+
+
+def main():
+    if len(set(ALL_SOURCES)) != len(ALL_SOURCES):
+        raise ValueError("All six SOURCE_* settings must use distinct OBS source names.")
+    download_models()
+    cap = None
+    try:
+        with ExitStack() as stack:
+            detectors = create_detectors(stack)
+            camera_index = int(os.getenv("CAMERA_INDEX", "0"))
+            cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(camera_index)
+            if not cap.isOpened():
+                raise RuntimeError("Cannot open camera. Check CAMERA_INDEX and other camera apps.")
+            try_connect_obs(verbose=True)
+            sync_obs_sources(None)
+            run_detection(cap, *detectors)
+    finally:
+        if cap is not None:
+            cap.release()
+        cv2.destroyAllWindows()
+        if is_obs_connected:
+            sync_obs_sources(None)
         try:
             ws.disconnect()
         except Exception:
             pass
+
+
+if __name__ == "__main__":
+    main()
